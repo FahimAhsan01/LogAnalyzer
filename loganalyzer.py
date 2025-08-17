@@ -36,27 +36,30 @@ if 'semantic_cache' not in st.session_state:
 if 'answer_cache' not in st.session_state:
     st.session_state['answer_cache'] = {}
 # Initialization (once, e.g. at app startup)
+    
+ORIGINAL_RAG_PROMPT = """
+You are a helpful cybersecurity assistant. Use the pieces of information provided in the context below to answer the user's question as clearly, concisely, and specifically as possible.
 
-if 'rag_prompt' not in st.session_state:
-    st.session_state['rag_prompt'] = """
-    You are a helpful cybersecurity assistant. Use the pieces of information provided in the context below to answer the user's question as clearly, concisely, and specifically as possible.
+- Base your answer only on the context—do not add facts or details not present in the context.
+- If the answer can be found or reasoned from the context, respond directly and concretely.
+- If the answer cannot be determined from the context, simply reply: "I don't know."
+- If the question is ambiguous or cannot be answered with the provided information, ask the user to clarify.
+- If user asks for specific fields (such as source IPs, failed/successful attempts, usernames, commands), extract and summarize those from the context where possible.
+- Prefer clear lists, tables, or bullet points if several facts are relevant.
+- Do not repeat the entire context—make your answer focused and relevant to the question.
+"""
+FIXED_PROMPT_FOOTER = """
+Context:
+{context}
 
-    - Base your answer only on the context—do not add facts or details not present in the context.
-    - If the answer can be found or reasoned from the context, respond directly and concretely.
-    - If the answer cannot be determined from the context, simply reply: "I don't know."
-    - If the question is ambiguous or cannot be answered with the provided information, ask the user to clarify.
-    - If user asks for specific fields (such as source IPs, failed/successful attempts, usernames, commands), extract and summarize those from the context where possible.
-    - Prefer clear lists, tables, or bullet points if several facts are relevant.
-    - Do not repeat the entire context—make your answer focused and relevant to the question.
+Question:
+{question}
 
-    Context:
-    {context}
+Answer:
+"""
 
-    Question:
-    {question}
-
-    Answer:
-    """
+if 'rag_instruction' not in st.session_state:
+    st.session_state['rag_instruction'] = ORIGINAL_RAG_PROMPT
 # ------- CORE LOGIC -------
 
 @st.cache_resource(show_spinner=False)
@@ -144,7 +147,11 @@ with st.sidebar:
         DUCKDB_TABLE = st.text_input("DuckDB Table", value=DEFAULT_DUCKDB_TABLE, key="duckdb_table")
         CACHE_TTL = st.number_input("Cache TTL (s)", min_value=60, max_value=86400, value=DEFAULT_CACHE_TTL, step=60, key="cache_ttl")
         if st.checkbox("Edit RAG Prompt Template (Advanced)", value=False, key="edit_prompt"):
-            st.session_state['rag_prompt'] = st.text_area("Edit Prompt", value=st.session_state['rag_prompt'], height=250)
+            st.session_state['rag_instruction'] = st.text_area(
+                "Edit Instructions", value=st.session_state['rag_instruction'], height=250
+            )
+            
+    full_prompt = st.session_state['rag_instruction'] + FIXED_PROMPT_FOOTER
 
     # APP MONITORING
     SHOW_ADVANCED = st.checkbox("Show Advanced App Monitoring Panel", value=True, key="show_adv")
@@ -206,15 +213,17 @@ if page == "RAG Q&A (Semantic)":
                                 if md:
                                     st.markdown("**Metadata:**")
                                     st.json(md)
-    prompt = PromptTemplate(
-        template=st.session_state['rag_prompt'],
-        input_variables=["context", "question"],
+    
+    qa_prompt_template = PromptTemplate(
+        template=full_prompt,
+        input_variables=["context", "question"]
     )
 
-    prompt = st.chat_input("Ask your log question here...")  # --- INPUT IS LAST ---
-    if prompt and vectorstore is not None:
-        st.session_state.messages.append({'role': 'user', 'content': prompt})
-        cache_key = prompt.strip().lower()
+    user_query = st.chat_input("Ask your log question here...")
+
+    if user_query and vectorstore is not None:
+        st.session_state.messages.append({'role': 'user', 'content': user_query})
+        cache_key = user_query.strip().lower()
         start_time = time.perf_counter()
         now = time.time()
         from_cache = None
@@ -226,20 +235,17 @@ if page == "RAG Q&A (Semantic)":
             source_docs = cached["source_documents"]
             from_cache = "exact"
         else:
-            # 2. Semantic cache (very strict threshold)
-            # Get prompt embedding as vector
-            emb_model = embedding_model   # HuggingFaceEmbeddings
-            prompt_emb = np.array(emb_model.embed_documents([prompt])[0])  # Length d vector
-
-            threshold = 0.93   # very high
+            # 2. Semantic cache
+            emb_model = embedding_model
+            user_emb = np.array(emb_model.embed_documents([user_query])[0])
+            threshold = 0.93
             semantic_hit = None
             similarity = 0
             for entry in st.session_state.semantic_cache:
-            # filter out expired
                 if now - entry.get("time", 0) > CACHE_TTL:
                     continue
                 emb = entry['embedding']
-                sim = float(np.dot(prompt_emb, emb) / (np.linalg.norm(prompt_emb) * np.linalg.norm(emb)))
+                sim = float(np.dot(user_emb, emb) / (np.linalg.norm(user_emb) * np.linalg.norm(emb)))
                 if sim > threshold:
                     semantic_hit = entry
                     similarity = sim
@@ -262,9 +268,9 @@ if page == "RAG Q&A (Semantic)":
                         chain_type="stuff",
                         retriever=vectorstore.as_retriever(search_kwargs={'k': 25}),
                         return_source_documents=True,
-                        chain_type_kwargs={'prompt': prompt}
+                        chain_type_kwargs={'prompt': qa_prompt_template}
                     )
-                    response = qa_chain.invoke({'query': prompt})
+                    response = qa_chain.invoke({'query': user_query})
                     result = response.get("result", "").strip()
                     source_docs = response.get("source_documents", [])
 
@@ -275,8 +281,8 @@ if page == "RAG Q&A (Semantic)":
                     "time": now
                 }
                 st.session_state.semantic_cache.append({
-                    "prompt": prompt,
-                    "embedding": prompt_emb,
+                    "prompt": user_query,
+                    "embedding": user_emb,
                     "result": result,
                     "source_documents": source_docs,
                     "time": now
@@ -290,6 +296,12 @@ if page == "RAG Q&A (Semantic)":
             timing_info += f" [cache: {from_cache}]"
         else:
             timing_info += " (live answer)"
+
+        record_query(
+            prompt=user_query,
+            latency_s=response_time,
+            from_cache=from_cache
+        )
 
         st.session_state.messages.append({
             'role': 'assistant',
