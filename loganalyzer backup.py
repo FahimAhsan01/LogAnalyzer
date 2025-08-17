@@ -1,21 +1,37 @@
 import os
-import time
+import duckdb
 import streamlit as st
+import time
 import numpy as np
-from typing import Optional
-
 from langchain.chains import RetrievalQA
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
-from langchain_core.prompts import PromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-
+from langchain_core.prompts import PromptTemplate
 from dotenv import load_dotenv, find_dotenv
+import argparse
+
+# ------- CONFIGURABLE PATHS AND CACHE TTL -------
+
 load_dotenv(find_dotenv())
 
-DB_FAISS_PATH = "vectorstore/db_faiss"
-CACHE_TTL_SECONDS = 3600  # Cache time-to-live in seconds (1 hour)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Streamlit RAG & SQL Log Analyzer")
+    parser.add_argument("--db_faiss", type=str, default=os.getenv("DB_FAISS_PATH", "vectorstore/db_faiss"))
+    parser.add_argument("--duckdb",   type=str, default=os.getenv("DUCKDB_PATH", "vectorstore/vector_metadata.duckdb"))
+    parser.add_argument("--table",    type=str, default=os.getenv("DUCKDB_TABLE", "vector_chunks"))
+    parser.add_argument("--cache_ttl", type=int, default=int(os.getenv("CACHE_TTL", "3600")))
+    return parser.parse_args()
+
+args = parse_args()
+DB_FAISS_PATH = args.db_faiss
+DUCKDB_PATH = args.duckdb
+DUCKDB_TABLE = args.table
+CACHE_TTL = args.cache_ttl
+
+print(f"[CONFIG] DB_FAISS_PATH={DB_FAISS_PATH}, DUCKDB_PATH={DUCKDB_PATH}, TABLE={DUCKDB_TABLE}, CACHE_TTL={CACHE_TTL}")
+
+# ------- CORE LOGIC -------
 
 @st.cache_resource(show_spinner=False)
 def load_embedding_model():
@@ -29,226 +45,207 @@ def load_vectorstore(_embedding_model):
     db = FAISS.load_local(DB_FAISS_PATH, _embedding_model, allow_dangerous_deserialization=True)
     return db
 
+@st.cache_resource(show_spinner=True)
+def load_duckdb_conn():
+    if not os.path.exists(DUCKDB_PATH):
+        st.error(f"DuckDB database not found at {DUCKDB_PATH}")
+        return None
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    return con
+
+def available_fields(con, table):
+    result = con.execute(f"PRAGMA table_info({table})").fetchdf()
+    return list(result['name'])
+
 def set_custom_prompt():
-    custom_prompt_template = """
+    prompt_template = """
         Use the pieces of information provided in the context to answer user's question.
         If you don't know the answer, just say that you don't know; don't try to make up an answer.
         Do not provide anything out of the given context.
         If the context is not enough to answer the question, just say that you don't know.
         If the user's question asked for a specific piece of information, try to provide that specific piece of information.
         If the user's question is not clear, ask for clarification.
-        If the user's question requires a specific format, try to provide that format.
         If user asks for source IPs, provide the source IPs from the context of the attack attempts.
         If user asks for successful attack attempts, provide the successful attack attempts from the context by checking if the success was TRUE.
-
+        If user asks for failed attack attempts, provide the failed attack attempts from the context by checking if the success was FALSE.
+        If user asks for commands used by attackers, provide the commands used by attackers from the context while giving priority to the more complex commands.
         Context: {context}
         Question: {question}
+        Let's think step by step.
     """
-    prompt = PromptTemplate(template=custom_prompt_template, input_variables=["context", "question"])
-    return prompt
+    return PromptTemplate(template=prompt_template, input_variables=["context", "question"])
 
-def load_llm():
-    groq_api_key = os.getenv("GROQ_API_KEY")
-    if not groq_api_key:
-        st.error("GROQ_API_KEY not found in environment variables")
-        return None
-    llm = HuggingFaceEndpoint(
-        repo_id="mistralai/Mistral-7B-Instruct-v0.3",
-        temperature=0.4,
-        max_new_tokens=512,
-        task="conversational",
-        token=groq_api_key # type: ignore
-    )
-    chat_model = ChatHuggingFace(llm=llm)
-    return chat_model
 
-def cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
-    if np.linalg.norm(vec_a) == 0 or np.linalg.norm(vec_b) == 0:
-        return 0.0
-    return np.dot(vec_a, vec_b) / (np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+st.title("Unified Log RAG & SQL Analyzer")
 
-def get_semantic_cached_answer(prompt: str, embedding: np.ndarray, cache: dict, threshold: float = 0.85) -> Optional[tuple]:
-    """
-    Find cached answer semantically similar to prompt embedding above threshold.
-    Returns cached (result, source_docs) or None if no good match.
-    """
-    now = time.time()
-    best_match = None
-    best_score = -1.0
+# --- Sidebar navigation instead of tabs (always visible) ---
+st.sidebar.markdown("## Navigation")
+page = st.sidebar.radio("Select your mode:", ["RAG Q&A (Semantic)", "Analytics (SQL Table)"])
 
-    keys_to_delete = []
-    for key, entry in cache.items():
-        cached_time = entry['timestamp']
-        if now - cached_time > CACHE_TTL_SECONDS:
-            keys_to_delete.append(key)
-            continue
-        sim = cosine_similarity(embedding, entry['embedding'])
-        if sim > best_score and sim >= threshold:
-            best_score = sim
-            best_match = entry
+with st.sidebar:
+    st.markdown("## Tools/Options")
+    if st.button("Refresh Vector Store and Embedding Model"):
+        st.cache_resource.clear()
+        st.success("Vector store and embedding model caches cleared. They will reload on next question.")
 
-    # Evict expired cache entries
-    for key in keys_to_delete:
-        del cache[key]
+    # Separate clear buttons
+    if st.button("Clear Chat History"):
+        st.session_state['messages'] = []
+        st.success("Chat history cleared.")
 
-    if best_match:
-        return best_match['result'], best_match['source_documents']
-    return None
+    if st.button("Clear Answer Cache"):
+        st.session_state['answer_cache'] = {}
+        st.session_state['semantic_cache'] = []
+        st.success("Answer caches cleared.")
 
-def main():
-    st.title("The Log Analyzer")
 
-    # Initialize session state entries
+if page == "RAG Q&A (Semantic)":
     if 'messages' not in st.session_state:
         st.session_state.messages = []
-    if 'vectorstore' not in st.session_state:
-        embedding_model = load_embedding_model()
-        st.session_state.vectorstore = load_vectorstore(embedding_model)
-        st.session_state.embedding_model = embedding_model
-    if 'response_time' not in st.session_state:
-        st.session_state.response_time = None
+    if 'semantic_cache' not in st.session_state:
+        st.session_state.semantic_cache = []  # Each item: {'embedding', 'prompt', 'result', 'source_docs'}
     if 'answer_cache' not in st.session_state:
-        # Cache structure: {key: {embedding: np.array, result: str, source_documents: list, timestamp: float}}
         st.session_state.answer_cache = {}
+    embedding_model = load_embedding_model()
+    vectorstore = load_vectorstore(embedding_model)
+    st.header("Semantic Log Q&A")
 
-    # Sidebar controls for clearing history and refreshing vectorstore
-    with st.sidebar:
-        if st.button("Clear Chat History and Cache"):
-            st.session_state.messages = []
-            st.session_state.answer_cache = {}
-            st.success("Chat history and cache cleared.")
-        if st.button("Refresh Vector Store"):
-            embedding_model = load_embedding_model()
-            st.session_state.vectorstore = load_vectorstore(embedding_model)
-            st.session_state.embedding_model = embedding_model
-            st.success("Vector store refreshed.")
-
-    # Display chat messages
-    for message in st.session_state.messages:
+    # Show chat history (user/assistant, top-to-bottom, input always last)
+    for i, message in enumerate(st.session_state.messages):
         st.chat_message(message['role']).markdown(message['content'])
+        if message['role'] == 'assistant':
+            if i > 0 and 'source_documents' in st.session_state.messages[i-1]:
+                resp_docs = st.session_state.messages[i-1]['source_documents']
+                if resp_docs:
+                    with st.expander("Source Documents (click to expand/collapse all)", expanded=False):
+                        for j, doc in enumerate(resp_docs, 1):
+                            md = doc.metadata
+                            label = f"Source {j}: session={md.get('session','?')}, time={md.get('timestamp','?')}"
+                            with st.expander(label, expanded=False):
+                                st.markdown(doc.page_content if doc.page_content else "*No page content*")
+                                if md:
+                                    st.markdown("**Metadata:**")
+                                    st.json(md)
 
-    # Input prompt
-    prompt = st.chat_input("Pass your prompt here")
-
-    if prompt:
-        st.chat_message('user').markdown(prompt)
+    prompt = st.chat_input("Ask your log question here...")  # --- INPUT IS LAST ---
+    if prompt and vectorstore is not None:
         st.session_state.messages.append({'role': 'user', 'content': prompt})
+        cache_key = prompt.strip().lower()
+        start_time = time.perf_counter()
+        now = time.time()
+        from_cache = None
 
-        if st.session_state.vectorstore is None:
-            st.error("Vector store is not loaded. Please refresh vector store or check logs.")
-            return
-
-        # Compute embedding for prompt for semantic cache lookup
-        embedding_vec = st.session_state.embedding_model.embed_documents([prompt])
-        if embedding_vec:
-            embedding_vec = np.array(embedding_vec[0])
+        # 1. Exact cache
+        cached = st.session_state.answer_cache.get(cache_key)
+        if cached and (now - cached.get("time", 0) < CACHE_TTL):
+            result = cached["result"]
+            source_docs = cached["source_documents"]
+            from_cache = "exact"
         else:
-            embedding_vec = None
+            # 2. Semantic cache (very strict threshold)
+            emb_model = embedding_model   # HuggingFaceEmbeddings
+            prompt_emb = np.array(emb_model.embed_documents([prompt])[0])  # Length d vector
 
-        cached_answer = None
-        if embedding_vec is not None:
-            cached_answer = get_semantic_cached_answer(prompt, embedding_vec, st.session_state.answer_cache, threshold=0.95)
+            threshold = 0.93   # very high
+            semantic_hit = None
+            similarity = 0
+            for entry in st.session_state.semantic_cache:
+                # filter out expired
+                if now - entry.get("time", 0) > CACHE_TTL:
+                    continue
+                emb = entry['embedding']
+                sim = float(np.dot(prompt_emb, emb) / (np.linalg.norm(prompt_emb) * np.linalg.norm(emb)))
+                if sim > threshold:
+                    semantic_hit = entry
+                    similarity = sim
+                    break
 
-        if cached_answer:
-            cached_result, cached_source_docs = cached_answer
-            st.chat_message('assistant').markdown(cached_result)
-            st.session_state.messages.append({'role': 'assistant', 'content': cached_result})
-            st.markdown("**Response retrieved from semantic cache**")
-            if cached_source_docs:
-                st.markdown("---")
-                st.markdown("#### Source Documents (Context)")
-                with st.expander("Source Documents (Context)", expanded=False):
-                    for i, doc in enumerate(cached_source_docs, 1):
-                        with st.expander(f"Document {i} metadata: {doc.metadata.get('session', 'N/A')}"):
-                            st.write(doc.page_content)
+            if semantic_hit is not None:
+                result = semantic_hit["result"]
+                source_docs = semantic_hit.get("source_documents", [])
+                from_cache = f"semantic ({similarity:.2f})"
+            else:
+                # 3. No cache hit: generate answer
+                with st.spinner("Generating answer..."):
+                    qa_chain = RetrievalQA.from_chain_type(
+                        llm=ChatGroq(
+                            model_name="meta-llama/llama-4-maverick-17b-128e-instruct", # type: ignore
+                            temperature=0.5,
+                            groq_api_key=os.getenv("GROQ_API_KEY"), # type: ignore
+                            verbose=True,
+                        ),
+                        chain_type="stuff",
+                        retriever=vectorstore.as_retriever(search_kwargs={'k': 25}),
+                        return_source_documents=True,
+                        chain_type_kwargs={'prompt': set_custom_prompt()}
+                    )
+                    response = qa_chain.invoke({'query': prompt})
+                    result = response.get("result", "").strip()
+                    source_docs = response.get("source_documents", [])
+
+                # Save to both caches for future
+                st.session_state.answer_cache[cache_key] = {
+                    "result": result,
+                    "source_documents": source_docs,
+                    "time": now
+                }
+                st.session_state.semantic_cache.append({
+                    "prompt": prompt,
+                    "embedding": prompt_emb,
+                    "result": result,
+                    "source_documents": source_docs,
+                    "time": now
+                })
+
+        end_time = time.perf_counter()
+        response_time = end_time - start_time
+
+        timing_info = f"\n\n---\nResponse time: {response_time:.2f}s"
+        if from_cache:
+            timing_info += f" [cache: {from_cache}]"
         else:
-            # Not in cache, query LLM retrieval pipeline
-            try:
-                start_time = time.time()
+            timing_info += " (live answer)"
 
-                qa_chain = RetrievalQA.from_chain_type(
-                    llm=ChatGroq(
-                        model_name="meta-llama/llama-4-maverick-17b-128e-instruct",  # type: ignore
-                        temperature=0.5,
-                        groq_api_key=os.getenv("GROQ_API_KEY"),  # type: ignore
-                        verbose=True
-                    ),  # type: ignore
-                    chain_type="stuff",
-                    retriever=st.session_state.vectorstore.as_retriever(search_kwargs={'k': 25}),
-                    return_source_documents=True,
-                    chain_type_kwargs={'prompt': set_custom_prompt()}
-                )
+        st.session_state.messages.append({
+            'role': 'assistant',
+            'content': result + timing_info,
+            'source_documents': source_docs
+        })
+        st.rerun()
 
-                response = qa_chain.invoke({'query': prompt})
-                result = response.get("result", "").strip()
-                source_docs = response.get("source_documents", [])
 
-                # Expanded fallback trigger condition with substring matching
-                fallback_triggers = [
-                    "no answer returned", "i don't know", "i do not know",
-                    "cannot answer", "unknown", "no relevant info", "no information available","the context does not provide information"
-                ]
-                retrieval_answer_lower = result.lower()
-
-                if not result or any(trigger in retrieval_answer_lower for trigger in fallback_triggers):
-                    fallback_prompt = (
-                        f"Answer the following question based only on your general knowledge. "
-                        f"If you don't know the answer, say so.\nQuestion: {prompt}"
-                    )
-
-                    fallback_llm = ChatGroq(
-                        model_name="meta-llama/llama-4-maverick-17b-128e-instruct", # type: ignore
-                        temperature=0.7,
-                        groq_api_key=os.getenv("GROQ_API_KEY"), # type: ignore
-                        verbose=True
-                    )
-                    fallback_response = fallback_llm.invoke(fallback_prompt)
-
-                    fallback_answer = ""
-                    if isinstance(fallback_response, dict):
-                        fallback_answer = fallback_response.get("text", "").strip()
-                    elif isinstance(fallback_response, str):
-                        fallback_answer = fallback_response.strip()
-                    elif hasattr(fallback_response, "content"):
-                        # If fallback_response is an AIMessage or similar, get content attribute
-                        fallback_answer = fallback_response.content
-
-                    # st.write("Fallback prompt sent:", fallback_prompt)  # Debug info
-                    # st.write("Fallback response received:", repr(fallback_answer))  # Debug info
-
-                    if fallback_answer:
-                        st.markdown("**Note:** Provided answer generated by fallback pipeline (LLM only, no retrieval context).")
-                        result = fallback_answer
-                        source_docs = []
-
-                end_time = time.time()
-                latency = end_time - start_time
-                st.session_state.response_time = latency
-
-                # Cache the response with timestamp and embedding
-                if embedding_vec is not None:
-                    st.session_state.answer_cache[prompt] = {
-                        'embedding': embedding_vec,
-                        'result': result,
-                        'source_documents': source_docs,
-                        'timestamp': time.time()
-                    }
-
-                st.chat_message('assistant').markdown(result)
-                st.session_state.messages.append({'role': 'assistant', 'content': result})
-
-                st.markdown(f"**Response time:** {latency:.2f} seconds")
-
-                if source_docs:
-                    st.markdown("---")
-                    st.markdown("#### Source Documents (Context)")
-                    with st.expander("Source Documents (Context)", expanded=False):
-                        for i, doc in enumerate(source_docs, 1):
-                            with st.expander(f"Document {i} metadata: {doc.metadata.get('session', 'N/A')}"):
-                                st.write(doc.page_content)
-
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-
-if __name__ == "__main__":
-    main()
+elif page == "Analytics (SQL Table)":
+    duck_con = load_duckdb_conn()
+    table = DUCKDB_TABLE
+    if duck_con is not None:
+        fields = available_fields(duck_con, table)
+        placeholder = "-- Select field --"
+        st.header("SQL-powered Metadata Table Explorer")
+        mode = st.selectbox("Choose Action", ["Sample", "Count by Field", "Substring Search", "Exact Match"])
+        if mode == "Sample":
+            st.dataframe(duck_con.execute(f"SELECT * FROM {table} LIMIT 10").fetchdf())
+        elif mode == "Count by Field":
+            field = st.selectbox("Field", [placeholder]+fields, key="sql_count")
+            if field != placeholder:
+                q = f"SELECT {field}, COUNT(*) cnt FROM {table} GROUP BY {field} ORDER BY cnt DESC"
+                st.dataframe(duck_con.execute(q).fetchdf())
+        elif mode == "Substring Search":
+            field = st.selectbox("Field", [placeholder]+fields, key="sql_substr")
+            substr = st.text_input("Substring (case-insensitive)")
+            if field != placeholder and substr:
+                q = f"SELECT * FROM {table} WHERE {field} ILIKE '%{substr}%' LIMIT 50"
+                st.dataframe(duck_con.execute(q).fetchdf())
+        elif mode == "Exact Match":
+            field = st.selectbox("Field", [placeholder]+fields, key="sql_exact")
+            value = st.text_input("Value to match exactly")
+            if field != placeholder and value:
+                q = f"SELECT * FROM {table} WHERE {field} = ? LIMIT 50"
+                st.dataframe(duck_con.execute(q, [value]).fetchdf())
+        if "anomaly_flag" in fields:
+            with st.expander("Anomaly Flag Count"):
+                st.dataframe(duck_con.execute(f"SELECT anomaly_flag, COUNT(*) cnt FROM {table} GROUP BY anomaly_flag").fetchdf())
+        if "mitre_ttp" in fields:
+            with st.expander("Unique MITRE TTPs (first 10)"):
+                st.dataframe(duck_con.execute(f"SELECT DISTINCT mitre_ttp FROM {table} LIMIT 10").fetchdf())
+    else:
+        st.warning("Load or generate a vector_metadata.duckdb for analytics.")

@@ -5,36 +5,52 @@ import pandas as pd
 import requests
 from pathlib import Path
 from tqdm import tqdm
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union, Generator
 from datetime import datetime
 from dotenv import load_dotenv, find_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 load_dotenv(find_dotenv())
 IPINFO_TOKEN = os.environ.get("IPINFO_TOKEN")
 
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class CowrieJSONProcessor:
-    """Optimized parser for Cowrie JSON logs with session reconstruction"""
 
-    def __init__(self, output_dir: str = "processed_data"):
+class CowrieJSONProcessor:
+    """Optimized parser for Cowrie JSON logs with session reconstruction and enhanced features"""
+
+    def __init__(self, output_dir: str = "processed_data", output_format: str = "parquet", max_workers: int = 4):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.geo_cache = {}
         self.session_cache = {}  # Track sessions across events
         self.attack_matrix = self._load_mitre_matrix()
+        self.output_format = output_format.lower()
+        self.max_workers = max_workers
+        self.anomaly_commands = [
+            # Sample anomaly patterns to flag suspicious commands
+            'rm -rf /', 'wget http', 'curl http', 'nc -l', 'netcat', 'exec ', 'base64 -d', 'chmod 777',
+            'ssh-keyscan', 'ssh ', 'scp ', 'telnet ', 'ftp ', 'sftp ', 'python -c', 'perl -e', 'eval '
+        ]
 
     def _load_mitre_matrix(self) -> Dict[str, List[str]]:
-        """Expanded MITRE ATT&CK patterns with technique IDs"""
+        """Expanded MITRE ATT&CK patterns with technique IDs including wider coverage"""
+        # This matrix is extended with additional well-known attack techniques and keywords
         return {
-            'T1087': ['whoami', 'id', 'w', 'getent passwd', 'cat /etc/passwd'],
-            'T1059': ['bash', 'sh', 'python', 'perl', 'php', 'awk', r'\./'],
-            'T1552': ['unshadow', 'cat /etc/shadow', 'find / -name id_rsa'],
-            'T1021': ['ssh ', 'scp ', 'telnet ', 'ftp ', 'sftp '],
-            'T1070': ['rm -rf', 'shred', 'echo "" > ', 'logrotate --force'],
-            'T1056': ['keylogger', 'strace', 'ltrace', 'cat .ssh/known_hosts'],
-            'T1569': ['systemctl', 'service', '/etc/init.d/', 'killall', 'pkill']
+            'T1087': ['whoami', 'id', 'w', 'getent passwd', 'cat /etc/passwd', 'finger', 'id -u'],
+            'T1059': ['bash', 'sh', 'python', 'perl', 'php', 'awk', r'\./', 'powershell', 'cmd.exe', 'cscript'],
+            'T1552': ['unshadow', 'cat /etc/shadow', 'find / -name id_rsa', 'ssh-keygen', 'ssh-add'],
+            'T1021': ['ssh ', 'scp ', 'telnet ', 'ftp ', 'sftp ', 'rlogin', 'rexec'],
+            'T1070': ['rm -rf', 'shred', 'echo "" > ', 'logrotate --force', 'wipe', 'dd if=', 'cat /dev/null >'],
+            'T1056': ['keylogger', 'strace', 'ltrace', 'cat .ssh/known_hosts', 'xinput', 'wireshark'],
+            'T1569': ['systemctl', 'service', '/etc/init.d/', 'killall', 'pkill', 'cron', 'at '],
+            'T1003': ['hashdump', 'mimikatz', 'lsass', 'procdump'],  # Credential dumping
+            'T1135': ['net view', 'netsh', 'netstat', 'arp -a'],   # Network sniffing
+            'T1218': ['regsvr32', 'mshta', 'rundll32'],            # Signed binary proxy execution
+            'T1105': ['curl', 'wget', 'scp'],                      # Ingress tool transfer
         }
 
     def _geolocate_ip(self, ip: str) -> Dict[str, str]:
@@ -67,15 +83,20 @@ class CowrieJSONProcessor:
 
     def _categorize_ttp(self, command: str) -> Dict[str, List[str]]:
         """Map commands to MITRE techniques"""
-        command = command.lower()
+        command_lower = command.lower()
         matches = {}
         for tech_id, patterns in self.attack_matrix.items():
-            if any(p in command for p in patterns):
-                matches[tech_id] = [p for p in patterns if p in command]
+            if any(p in command_lower for p in patterns):
+                matches[tech_id] = [p for p in patterns if p in command_lower]
         return matches
 
+    def _detect_anomaly(self, command: str) -> bool:
+        """Flag suspicious commands based on predefined patterns"""
+        command_lower = command.lower()
+        return any(anom in command_lower for anom in self.anomaly_commands)
+
     def _process_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Core event processing with session awareness and enriched metadata"""
+        """Core event processing with session awareness, enriched metadata, and anomaly detection"""
         processed = {
             'timestamp': datetime.fromisoformat(event['timestamp'].rstrip('Z')),
             'event_type': event['eventid'],
@@ -137,9 +158,12 @@ class CowrieJSONProcessor:
 
         elif event_type == 'cowrie.command.input':
             command = event.get('input', '')
+            mitre_ttps = self._categorize_ttp(command)
+            anomaly_flag = self._detect_anomaly(command)
             processed.update({
                 'command': command,
-                'mitre_ttp': self._categorize_ttp(command)
+                'mitre_ttp': mitre_ttps,
+                'anomaly_flag': anomaly_flag
             })
 
         elif event_type == 'cowrie.session.file_download':
@@ -174,7 +198,7 @@ class CowrieJSONProcessor:
         return processed
 
     def parse_file(self, file_path: Path) -> pd.DataFrame:
-        """Parse JSON log file with progress tracking"""
+        """Parse single JSON log file with progress tracking"""
         if not file_path.is_file():
             logger.error(f"File not found: {file_path}")
             return pd.DataFrame()
@@ -195,47 +219,90 @@ class CowrieJSONProcessor:
                 pbar.update(1)
 
         df = pd.DataFrame(events)
-        # Verification: Log presence of key new fields
-        # if not df.empty:
-        #     logger.info(f"Columns in parsed data: {list(df.columns)}")
-        #     for col in ['username', 'password', 'connection_duration']:
-        #         if col in df.columns:
-        #             logger.info(f"Sample data for {col}: {df[col].dropna().head(3).tolist()}")
-        #         else:
-        #             logger.warning(f"Column {col} not found in parsed data!")
         return df
 
+    def parse_files_parallel(self, dir_path: Path) -> pd.DataFrame:
+        """Parse multiple files in parallel using ThreadPoolExecutor for faster processing"""
+        if not dir_path.is_dir():
+            logger.error(f"Not a directory: {dir_path}")
+            return pd.DataFrame()
+
+        files = list(dir_path.glob("*.json"))
+        if not files:
+            logger.warning(f"No JSON files found in {dir_path}")
+            return pd.DataFrame()
+
+        all_data = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self.parse_file, file): file for file in files}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Parallel parsing"):
+                file = futures[future]
+                try:
+                    df = future.result()
+                    if not df.empty:
+                        all_data.append(df)
+                except Exception as e:
+                    logger.error(f"Error processing {file}: {e}")
+
+        if all_data:
+            df_all = pd.concat(all_data, ignore_index=True)
+            return df_all
+        else:
+            return pd.DataFrame()
+
+    def parse_stream(self, stream: Generator[str, None, None]) -> pd.DataFrame:
+        """Parse log events from a stream (line by line) for real-time processing"""
+        events = []
+        for line in stream:
+            try:
+                json_event = json.loads(line.strip())
+                if parsed := self._process_event(json_event):
+                    events.append(parsed)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON in stream: {line[:100]}...")
+        return pd.DataFrame(events)
+
     def export_results(self, df: pd.DataFrame, name: str = "cowrie_events"):
-        """Save parsed data with timestamp"""
+        """Save parsed data in the specified format with timestamp"""
         if df.empty:
             logger.warning("No data to export")
             return
 
-        output_path = self.output_dir / f"{name}_{datetime.now():%Y%m%d_%H%M%S}.parquet"
-        df.to_parquet(output_path)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.output_format == "parquet":
+            output_path = self.output_dir / f"{name}_{timestamp}.parquet"
+            df.to_parquet(output_path)
+        elif self.output_format == "csv":
+            output_path = self.output_dir / f"{name}_{timestamp}.csv"
+            df.to_csv(output_path, index=False)
+        elif self.output_format in ("json", "jsonl", "jsonlines"):
+            output_path = self.output_dir / f"{name}_{timestamp}.jsonl"
+            df.to_json(output_path, orient="records", lines=True)
+        else:
+            logger.error(f"Unsupported output format: {self.output_format}")
+            return
+
         logger.info(f"Exported {len(df)} events to {output_path}")
 
 
 # Usage Example
 if __name__ == "__main__":
     import sys
-    processor = CowrieJSONProcessor()
+
+    output_format = "parquet"
+    processor = CowrieJSONProcessor(output_format=output_format)
 
     if len(sys.argv) < 2:
-        print("Usage: python cowrie_parser.py <path/to/cowrie.json>")
+        print("Usage: python processor_new_enhanced.py <path/to/cowrie.json or directory> [output_format]")
+        print("Output formats supported: parquet (default), csv, jsonl")
         sys.exit(1)
 
     log_path = Path(sys.argv[1])
+    if len(sys.argv) > 2:
+        processor.output_format = sys.argv[2].lower()
+
     if log_path.is_dir():
-        all_data = []
-        for file in log_path.glob("*.json"):
-            df = processor.parse_file(file)
-            if not df.empty:
-                all_data.append(df)
-        if all_data:
-            df = pd.concat(all_data, ignore_index=True)
-        else:
-            df = pd.DataFrame()
+        df = processor.parse_files_parallel(log_path)
     else:
         df = processor.parse_file(log_path)
 

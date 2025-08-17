@@ -40,19 +40,6 @@ def available_fields(con, table):
     result = con.execute(f"PRAGMA table_info({table})").fetchdf()
     return list(result['name'])
 
-def prune_caches(now, ttl):
-    """Remove expired entries from both caches."""
-    if 'answer_cache' in st.session_state:
-        st.session_state.answer_cache = {
-            k: v for k, v in st.session_state.answer_cache.items()
-            if now - v.get("time", 0) < ttl
-        }
-    if 'semantic_cache' in st.session_state:
-        st.session_state.semantic_cache = [
-            entry for entry in st.session_state.semantic_cache
-            if now - entry.get("time", 0) < ttl
-        ]
-
 def set_custom_prompt():
     prompt_template = """
         Use the pieces of information provided in the context to answer user's question.
@@ -125,140 +112,126 @@ if page == "RAG Q&A (Semantic)":
                                     st.json(md)
 
     prompt = st.chat_input("Ask your log question here...")  # --- INPUT IS LAST ---
-    if 'last_submitted' not in st.session_state:
-        st.session_state['last_submitted'] = ""
-
     if prompt and vectorstore is not None:
+        st.session_state.messages.append({'role': 'user', 'content': prompt})
+        cache_key = prompt.strip().lower()
+        start_time = time.perf_counter()
         now = time.time()
-        prune_caches(now, CACHE_TTL)
+        from_cache = None
 
-        # Only handle prompt if not just handled (avoids double answer after rerun)
-        if prompt != st.session_state['last_submitted']:
-            st.session_state.messages.append({'role': 'user', 'content': prompt})
-            cache_key = prompt.strip().lower()
-            start_time = time.perf_counter()
-            from_cache = None
+        # 1. Exact cache
+        cached = st.session_state.answer_cache.get(cache_key)
+        if cached and (now - cached.get("time", 0) < CACHE_TTL):
+            result = cached["result"]
+            source_docs = cached["source_documents"]
+            from_cache = "exact"
+        else:
+            # 2. Semantic cache (very strict threshold)
+            # Get prompt embedding as vector
+            emb_model = embedding_model   # HuggingFaceEmbeddings
+            prompt_emb = np.array(emb_model.embed_documents([prompt])[0])  # Length d vector
 
-            # --- Cache Checks ---
-            cached = st.session_state.answer_cache.get(cache_key)
-            if cached and (now - cached.get("time", 0) < CACHE_TTL):
-                result = cached["result"]
-                source_docs = cached["source_documents"]
-                cache_source = "exact"
+            threshold = 0.93   # very high
+            semantic_hit = None
+            similarity = 0
+            for entry in st.session_state.semantic_cache:
+            # filter out expired
+                if now - entry.get("time", 0) > CACHE_TTL:
+                    continue
+                emb = entry['embedding']
+                sim = float(np.dot(prompt_emb, emb) / (np.linalg.norm(prompt_emb) * np.linalg.norm(emb)))
+                if sim > threshold:
+                    semantic_hit = entry
+                    similarity = sim
+                    break
+
+            if semantic_hit is not None:
+                result = semantic_hit["result"]
+                source_docs = semantic_hit.get("source_documents", [])
+                from_cache = f"semantic ({similarity:.2f})"
             else:
-                # Semantic cache
-                emb_model = embedding_model
-                prompt_emb = np.array(emb_model.embed_documents([prompt])[0])
-                threshold = 0.93
-                semantic_hit = None
-                similarity = 0
-                for entry in st.session_state.semantic_cache:
-                    if now - entry.get("time", 0) > CACHE_TTL:
-                        continue
-                    emb = entry['embedding']
-                    sim = float(np.dot(prompt_emb, emb) / (np.linalg.norm(prompt_emb) * np.linalg.norm(emb)))
-                    if sim > threshold:
-                        semantic_hit = entry
-                        similarity = sim
-                        break
-                if semantic_hit is not None:
-                    result = semantic_hit["result"]
-                    source_docs = semantic_hit.get("source_documents", [])
-                    cache_source = f"semantic ({similarity:.2f})"
-                else:
-                    with st.spinner("Generating answer..."):
-                        try:
-                            qa_chain = RetrievalQA.from_chain_type(
-                                llm=ChatGroq(
-                                    model_name="meta-llama/llama-4-maverick-17b-128e-instruct", # type: ignore
-                                    temperature=0.5,
-                                    groq_api_key=os.getenv("GROQ_API_KEY"), # type: ignore
-                                    verbose=True,
-                                ),
-                                chain_type="stuff",
-                                retriever=vectorstore.as_retriever(search_kwargs={'k': 25}),
-                                return_source_documents=True,
-                                chain_type_kwargs={'prompt': set_custom_prompt()}
-                            )
-                            response = qa_chain.invoke({'query': prompt})
-                            result = response.get("result", "").strip()
-                            source_docs = response.get("source_documents", [])
-                        except Exception as e:
-                            result = f":red[An error occurred while retrieving your answer: {e}]"
-                            source_docs = []
-                        
-                    # Save to caches only if not error
-                    if not result.strip().startswith(":red[An error"):
-                        st.session_state.answer_cache[cache_key] = {
-                            "result": result,
-                            "source_documents": source_docs,
-                            "time": now
-                        }
-                        st.session_state.semantic_cache.append({
-                            "prompt": prompt,
-                            "embedding": prompt_emb,
-                            "result": result,
-                            "source_documents": source_docs,
-                            "time": now
-                        })
-                    cache_source = None
-    
-            end_time = time.perf_counter()
-            response_time = end_time - start_time
+                # 3. No cache hit: generate answer
+                with st.spinner("Generating answer..."):
+                    qa_chain = RetrievalQA.from_chain_type(
+                        llm=ChatGroq(
+                            model_name="meta-llama/llama-4-maverick-17b-128e-instruct", # type: ignore
+                            temperature=0.5,
+                            groq_api_key=os.getenv("GROQ_API_KEY"), # type: ignore
+                            verbose=True,
+                        ),
+                        chain_type="stuff",
+                        retriever=vectorstore.as_retriever(search_kwargs={'k': 25}),
+                        return_source_documents=True,
+                        chain_type_kwargs={'prompt': set_custom_prompt()}
+                    )
+                    response = qa_chain.invoke({'query': prompt})
+                    result = response.get("result", "").strip()
+                    source_docs = response.get("source_documents", [])
 
-            timing_info = f"\n\n---\nResponse time: {response_time:.2f}s"
-            if cache_source:
-                timing_info += f" [cache: {cache_source}]"
-            else:
-                timing_info += " (live answer)"
+                # Save to both caches for future
+                st.session_state.answer_cache[cache_key] = {
+                    "result": result,
+                    "source_documents": source_docs,
+                    "time": now
+                }
+                st.session_state.semantic_cache.append({
+                    "prompt": prompt,
+                    "embedding": prompt_emb,
+                    "result": result,
+                    "source_documents": source_docs,
+                    "time": now
+                })
 
-            st.session_state.messages.append({
-                'role': 'assistant',
-                'content': result + timing_info,
-                'source_documents': source_docs
-            })
-            st.session_state['last_submitted'] = prompt
-            st.rerun()
-        elif vectorstore is None:
-            st.warning(":red[Vectorstore failed to load. Please refresh vector store or check your setup.]")
+        end_time = time.perf_counter()
+        response_time = end_time - start_time
+
+        timing_info = f"\n\n---\nResponse time: {response_time:.2f}s"
+        if from_cache:
+            timing_info += f" [cache: {from_cache}]"
+        else:
+            timing_info += " (live answer)"
+
+        st.session_state.messages.append({
+            'role': 'assistant',
+            'content': result + timing_info,
+            'source_documents': source_docs
+        })
+        st.rerun()
 
 
 elif page == "Analytics (SQL Table)":
     duck_con = load_duckdb_conn()
     table = DUCKDB_TABLE
-    if duck_con is None:
-        st.warning(":red[DuckDB not loaded. Please check your database path and refresh.]")
+    if duck_con is not None:
+        fields = available_fields(duck_con, table)
+        placeholder = "-- Select field --"
+        st.header("SQL-powered Metadata Table Explorer")
+        mode = st.selectbox("Choose Action", ["Sample", "Count by Field", "Substring Search", "Exact Match"])
+        if mode == "Sample":
+            st.dataframe(duck_con.execute(f"SELECT * FROM {table} LIMIT 10").fetchdf())
+        elif mode == "Count by Field":
+            field = st.selectbox("Field", [placeholder]+fields, key="sql_count")
+            if field != placeholder:
+                q = f"SELECT {field}, COUNT(*) cnt FROM {table} GROUP BY {field} ORDER BY cnt DESC"
+                st.dataframe(duck_con.execute(q).fetchdf())
+        elif mode == "Substring Search":
+            field = st.selectbox("Field", [placeholder]+fields, key="sql_substr")
+            substr = st.text_input("Substring (case-insensitive)")
+            if field != placeholder and substr:
+                q = f"SELECT * FROM {table} WHERE {field} ILIKE '%{substr}%' LIMIT 50"
+                st.dataframe(duck_con.execute(q).fetchdf())
+        elif mode == "Exact Match":
+            field = st.selectbox("Field", [placeholder]+fields, key="sql_exact")
+            value = st.text_input("Value to match exactly")
+            if field != placeholder and value:
+                q = f"SELECT * FROM {table} WHERE {field} = ? LIMIT 50"
+                st.dataframe(duck_con.execute(q, [value]).fetchdf())
+        if "anomaly_flag" in fields:
+            with st.expander("Anomaly Flag Count"):
+                st.dataframe(duck_con.execute(f"SELECT anomaly_flag, COUNT(*) cnt FROM {table} GROUP BY anomaly_flag").fetchdf())
+        if "mitre_ttp" in fields:
+            with st.expander("Unique MITRE TTPs (first 10)"):
+                st.dataframe(duck_con.execute(f"SELECT DISTINCT mitre_ttp FROM {table} LIMIT 10").fetchdf())
     else:
-        if duck_con is not None:
-            fields = available_fields(duck_con, table)
-            placeholder = "-- Select field --"
-            st.header("SQL-powered Metadata Table Explorer")
-            mode = st.selectbox("Choose Action", ["Sample", "Count by Field", "Substring Search", "Exact Match"])
-            if mode == "Sample":
-                st.dataframe(duck_con.execute(f"SELECT * FROM {table} LIMIT 10").fetchdf())
-            elif mode == "Count by Field":
-                field = st.selectbox("Field", [placeholder]+fields, key="sql_count")
-                if field != placeholder:
-                    q = f"SELECT {field}, COUNT(*) cnt FROM {table} GROUP BY {field} ORDER BY cnt DESC"
-                    st.dataframe(duck_con.execute(q).fetchdf())
-            elif mode == "Substring Search":
-                field = st.selectbox("Field", [placeholder]+fields, key="sql_substr")
-                substr = st.text_input("Substring (case-insensitive)")
-                if field != placeholder and substr:
-                    q = f"SELECT * FROM {table} WHERE {field} ILIKE '%{substr}%' LIMIT 50"
-                    st.dataframe(duck_con.execute(q).fetchdf())
-            elif mode == "Exact Match":
-                field = st.selectbox("Field", [placeholder]+fields, key="sql_exact")
-                value = st.text_input("Value to match exactly")
-                if field != placeholder and value:
-                    q = f"SELECT * FROM {table} WHERE {field} = ? LIMIT 50"
-                    st.dataframe(duck_con.execute(q, [value]).fetchdf())
-            if "anomaly_flag" in fields:
-                with st.expander("Anomaly Flag Count"):
-                    st.dataframe(duck_con.execute(f"SELECT anomaly_flag, COUNT(*) cnt FROM {table} GROUP BY anomaly_flag").fetchdf())
-            if "mitre_ttp" in fields:
-                with st.expander("Unique MITRE TTPs (first 10)"):
-                    st.dataframe(duck_con.execute(f"SELECT DISTINCT mitre_ttp FROM {table} LIMIT 10").fetchdf())
-        else:
-            st.warning("Load or generate a vector_metadata.duckdb for analytics.")
+        st.warning("Load or generate a vector_metadata.duckdb for analytics.")
 

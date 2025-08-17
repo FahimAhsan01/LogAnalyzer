@@ -1,0 +1,23 @@
+{
+  "seen_keys": [
+    "6003eaddd612|cowrie.session.closed|2025-08-16T00:48:11.588047Z",
+    "202f7ccd2082|cowrie.session.connect|2025-08-16T22:13:22.425011Z",
+    "47dfd74bf925|cowrie.session.closed|2025-08-16T22:13:22.976520Z",
+    "6003eaddd612|cowrie.client.version|2025-08-16T00:47:20.766590Z",
+    "202f7ccd2082|cowrie.client.version|2025-08-16T22:13:22.435373Z",
+    "6003eaddd612|cowrie.log.closed|2025-08-16T00:48:11.581007Z",
+    "6003eaddd612|cowrie.client.size|2025-08-16T00:47:30.938398Z",
+    "47dfd74bf925|cowrie.session.connect|2025-08-16T22:13:22.974023Z",
+    "6003eaddd612|cowrie.client.kex|2025-08-16T00:47:20.772355Z",
+    "47dfd74bf925|cowrie.client.version|2025-08-16T22:13:22.974980Z",
+    "6003eaddd612|cowrie.session.params|2025-08-16T00:47:30.940431Z",
+    "202f7ccd2082|cowrie.session.closed|2025-08-16T22:13:22.438939Z",
+    "6003eaddd612|cowrie.command.input|2025-08-16T00:47:37.792840Z",
+    "6003eaddd612|cowrie.login.success|2025-08-16T00:47:30.891900Z",
+    "6003eaddd612|cowrie.command.input|2025-08-16T00:48:11.577822Z",
+    "6003eaddd612|cowrie.command.input|2025-08-16T00:47:36.143898Z",
+    "6003eaddd612|cowrie.session.connect|2025-08-16T00:47:20.763037Z",
+    "6003eaddd612|cowrie.command.input|2025-08-16T00:47:47.788617Z"
+  ],
+  "last_byte": 7509
+}
