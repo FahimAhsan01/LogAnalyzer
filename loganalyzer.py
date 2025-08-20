@@ -202,19 +202,18 @@ if page == "RAG Q&A (Semantic)":
     # Show chat history (user/assistant, top-to-bottom, input always last)
     for i, message in enumerate(st.session_state.messages):
         st.chat_message(message['role']).markdown(message['content'])
-        if message['role'] == 'assistant':
-            if i > 0 and 'source_documents' in st.session_state.messages[i-1]:
-                resp_docs = st.session_state.messages[i-1]['source_documents']
-                if resp_docs:
-                    with st.expander("Source Documents (click to expand/collapse all)", expanded=False):
-                        for j, doc in enumerate(resp_docs, 1):
-                            md = doc.metadata
-                            label = f"Source {j}: session={md.get('session','?')}, time={md.get('timestamp','?')}"
-                            with st.expander(label, expanded=False):
-                                st.markdown(doc.page_content if doc.page_content else "*No page content*")
-                                if md:
-                                    st.markdown("**Metadata:**")
-                                    st.json(md)
+        if message['role'] == 'assistant' and 'source_documents' in message:
+            resp_docs = message['source_documents']
+            if resp_docs:
+                with st.expander("Source Documents (click to expand/collapse all)", expanded=False):
+                    for j, doc in enumerate(resp_docs, 1):
+                        md = doc.metadata
+                        label = f"Source {j}: session={md.get('session','?')}, time={md.get('timestamp','?')}"
+                        with st.expander(label, expanded=False):
+                            st.markdown(doc.page_content if doc.page_content else "*No page content*")
+                            if md:
+                                st.markdown("**Metadata:**")
+                                st.json(md)
     
     qa_prompt_template = PromptTemplate(
         template=full_prompt,
@@ -268,13 +267,20 @@ if page == "RAG Q&A (Semantic)":
                             verbose=True,
                         ),
                         chain_type="stuff",
-                        retriever=vectorstore.as_retriever(search_kwargs={'k': 25}),
+                        retriever=vectorstore.as_retriever(search_kwargs={'k': 20}),
                         return_source_documents=True,
                         chain_type_kwargs={'prompt': qa_prompt_template}
                     )
                     response = qa_chain.invoke({'query': user_query})
                     result = response.get("result", "").strip()
                     source_docs = response.get("source_documents", [])
+                    
+                st.write(f"DEBUG: Source docs - type={type(source_docs)} len={len(source_docs)}")
+                if source_docs:
+                    st.write("DEBUG: First doc:", getattr(source_docs[0], 'page_content', '')[:200])
+                    st.write("DEBUG: First doc metadata:", getattr(source_docs, 'metadata', {}))
+                else:
+                    st.write("DEBUG: No source docs returned!")
 
                 # Save to both caches for future
                 st.session_state.answer_cache[cache_key] = {

@@ -18,7 +18,7 @@ import duckdb
 load_dotenv(find_dotenv())
 
 # --- Configuration
-COWRIE_JSON_URL = os.getenv("COWRIE_JSON_URL", "http://115.127.213.187:8080/cowrie.json")
+COWRIE_JSON_URL = os.getenv("COWRIE_JSON_URL", "http://115.127.213.187:8311/cowrie.json")
 STATE_FILE = os.getenv("COWRIE_PIPELINE_STATE", "pipeline_state.json")
 PROCESSED_DATA_DIR = os.getenv("PROCESSED_DATA_DIR", "processed_data")
 VECTORDIR = os.getenv("VECTORDB_PATH", "vectorstore/db_faiss")
@@ -47,6 +47,20 @@ MITRE_MATRIX = {
     'T1218': ['regsvr32', 'mshta', 'rundll32'],
     'T1105': ['curl', 'wget', 'scp'],
 }
+
+def enforce_df_schema(df, db_path, table_name="vector_chunks"):
+    import duckdb
+    # Get ordered schema from DuckDB
+    con = duckdb.connect(db_path)
+    schema_cols = [row[1] for row in con.execute(f"PRAGMA table_info('{table_name}')").fetchall()]
+    con.close()
+    # Add missing columns as None
+    for col in schema_cols:
+        if col not in df.columns:
+            df[col] = None
+    # Reorder columns and drop extras
+    df = df[schema_cols]
+    return df
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -266,6 +280,9 @@ def append_to_duckdb(docs, duckdb_path, table_name="vector_chunks"):
         print("No rows for DuckDB.")
         return 0
     df = pd.DataFrame(rows)
+
+    df = enforce_df_schema(df, duckdb_path, table_name)  # << ENFORCE!
+
     def convert_ndarray(obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
@@ -316,12 +333,17 @@ def main():
                         return json.dumps(val)
                     return str(val) if val is not None else ""
 
+                # Convert lists/dicts/arrays to JSON strings for all object columns, especially 'message'
                 for col in df_save.columns:
                     if df_save[col].dtype == "object":
                         df_save[col] = df_save[col].apply(convert_obj)
 
+                # Enforce schema order and complete missing columns before Parquet write
+                df_save = enforce_df_schema(df_save, DUCKDB_PATH, table_name="vector_chunks")
                 df_save.to_parquet(filename)
+
                 print(f"New events written to: {filename}")
+                
             vectorstore_update(docs, VECTORDIR, EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, EMBED_BATCH)
             append_to_duckdb(docs, DUCKDB_PATH)
             print(f"Run complete. Sleeping {SLEEP_SECONDS}s ...")
