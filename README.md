@@ -1,6 +1,7 @@
-# PMICS Log analyzer: Cybersecurity Log Analysis and AI-Powered Threat Intelligence System
+# Conversational AI-Enhanced Analysis of Retrieval Augmented Generation for Honeypot Data
 
-PMICS Log analyzer is an advanced cybersecurity log analysis and threat intelligence platform designed to ingest, enrich, analyze, and interactively query honeypot logs (such as Cowrie) using modern AI-powered techniques. It incorporates scalable real-time and batch pipelines, vector-based semantic search, MITRE ATT&CK mapping, anomaly detection, geospatial visualization, and an AI-driven chatbot interface for deep cyber threat investigation.
+
+Conversational AI-Enhanced Analysis of Retrieval Augmented Generation for Honeypot Data is an advanced cybersecurity log analysis and threat intelligence platform designed to ingest, enrich, analyze, and interactively query honeypot logs (such as Cowrie) using modern AI-powered techniques. It incorporates scalable real-time and batch pipelines, vector-based semantic search, MITRE ATT&CK mapping, anomaly detection, geospatial visualization, and an AI-driven chatbot interface for deep cyber threat investigation.
 
 ---
 
